@@ -430,7 +430,14 @@ async def handle_tool(
             metadata={"reply_id": extension_execution.reply_id},
         )
 
-    replyer_chat_history = list(tool_ctx.runtime._chat_history)
+    # Pending messages are ingested in bulk and history is only trimmed after the cycle,
+    # so bound the replyer to the same context window the planner used.
+    replyer_chat_history, _ = tool_ctx.runtime._chat_loop_service.select_llm_context_messages(
+        tool_ctx.runtime._chat_history,
+        request_kind="planner",
+        max_context_size=tool_ctx.runtime._max_context_size,
+        is_group_chat=tool_ctx.runtime.chat_stream.is_group_session,
+    )
     previous_target_reply = _find_recent_reply_to_target(replyer_chat_history, target_message_id)
     if previous_target_reply:
         reply_tool_args = _with_duplicate_target_reply_reminder(reply_tool_args, previous_target_reply)

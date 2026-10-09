@@ -20,6 +20,7 @@ from src.maisaka.builtin_tool import build_builtin_tool_handlers, get_all_builti
 from src.maisaka.builtin_tool import context as context_module
 from src.maisaka.builtin_tool import reply as reply_tool
 from src.maisaka.builtin_tool.context import BuiltinToolRuntimeContext
+from src.maisaka.chat_loop_service import MaisakaChatLoopService
 from src.maisaka.context.messages import SessionBackedMessage
 
 
@@ -39,9 +40,11 @@ def reply_context(monkeypatch):
     )
     runtime = SimpleNamespace(
         _chat_history=[],
+        _chat_loop_service=MaisakaChatLoopService,
+        _max_context_size=4,
         find_source_message_by_id=lambda message_id: source if message_id == "msg-1" else None,
         session_id="session-1",
-        chat_stream=SimpleNamespace(platform="qq"),
+        chat_stream=SimpleNamespace(platform="qq", is_group_session=True),
         log_prefix="test",
         _update_stage_status=lambda *args: None,
         record_planner_reply=lambda: None,
@@ -87,6 +90,42 @@ async def test_reply_sends_selected_picture_and_at_together(reply_context, monke
     assert generator.generate_reply_with_context.call_args.kwargs["reply_tool_args"] == {
         "attach_at": ["msg-1"], "attach_pic": [{"msg_id": "msg-1", "index": 1}],
     }
+
+
+@pytest.mark.asyncio
+async def test_reply_context_bounded_like_planner(reply_context, monkeypatch):
+    # Pending messages can be ingested in bulk before the post-cycle trim runs.
+    history = [
+        SessionBackedMessage(
+            raw_message=MessageSequence([TextComponent(f"消息{index}")]),
+            visible_text=f"消息{index}",
+            timestamp=datetime.now(),
+            message_id=f"history-{index}",
+        )
+        for index in range(200)
+    ]
+    reply_context.runtime._chat_history.extend(history)
+    generator = SimpleNamespace(generate_reply_with_context=AsyncMock(return_value=(
+        True, ReplyGenerationResult(success=True, completion=LLMCompletionResult(response_text="好")),
+    )))
+    monkeypatch.setattr(reply_tool.replyer_manager, "get_replyer", lambda **kwargs: generator)
+    monkeypatch.setattr(reply_tool, "_invoke_before_post_process_hook", AsyncMock(return_value=(
+        "好", {"skip_post_process": True},
+    )))
+    monkeypatch.setattr(reply_tool.send_service, "_send_to_target_with_message", AsyncMock(
+        return_value=SimpleNamespace(message_id="sent-1"),
+    ))
+
+    result = await reply_tool.handle_tool(reply_context, ToolInvocation("reply", arguments={"msg_id": "msg-1"}))
+
+    assert result.success
+    planner_history, _ = MaisakaChatLoopService.select_llm_context_messages(
+        history, request_kind="planner", max_context_size=4, is_group_chat=True,
+    )
+    replyer_history = generator.generate_reply_with_context.call_args.kwargs["chat_history"]
+    assert [message.message_id for message in replyer_history] == [message.message_id for message in planner_history]
+    assert len(replyer_history) < len(history)
+    assert replyer_history[-1] is history[-1]
 
 
 @pytest.mark.asyncio
